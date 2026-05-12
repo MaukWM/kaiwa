@@ -4,8 +4,10 @@ use base64::Engine;
 use futures::StreamExt;
 use poise::serenity_prelude as serenity;
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
+use songbird::input::{Input, RawAdapter};
+use songbird::Call;
 use songbird::SerenityInit;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite;
 
 const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";
@@ -31,10 +33,11 @@ impl VoiceEventHandler for VoiceReceiver {
                 );
             }
             EventContext::VoiceTick(tick) => {
+                let mut sent = false;
                 for (_ssrc, data) in &tick.speaking {
                     if let Some(decoded) = &data.decoded_voice {
-                        // Client-side noise gate: only send frames with actual speech.
-                        let sum_sq: f64 = decoded.iter()
+                        let sum_sq: f64 = decoded
+                            .iter()
                             .map(|&s| (s as f64) * (s as f64))
                             .sum();
                         let rms = (sum_sq / decoded.len() as f64).sqrt();
@@ -42,10 +45,15 @@ impl VoiceEventHandler for VoiceReceiver {
                         if rms > 300.0 {
                             let _ = self.audio_tx.try_send(decoded.clone());
                         } else {
-                            // Send silence so OpenAI's VAD can detect end of speech.
-                            let _ = self.audio_tx.try_send(vec![0i16; decoded.len()]);
+                            let _ = self.audio_tx.try_send(vec![0i16; 480]);
                         }
+                        sent = true;
                     }
+                }
+                // When nobody is speaking, still send silence so OpenAI's
+                // VAD can detect that speech has ended.
+                if !sent {
+                    let _ = self.audio_tx.try_send(vec![0i16; 480]);
                 }
             }
             EventContext::ClientDisconnect(disconnect) => {
@@ -57,7 +65,18 @@ impl VoiceEventHandler for VoiceReceiver {
     }
 }
 
-async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
+/// Convert PCM16 LE bytes to f32 bytes (what songbird's RawAdapter expects).
+fn pcm16_to_f32_bytes(pcm16: &[u8]) -> Vec<u8> {
+    let mut f32_bytes = Vec::with_capacity(pcm16.len() * 2); // i16 = 2 bytes, f32 = 4 bytes
+    for chunk in pcm16.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+        let f32_sample = sample as f32 / 32768.0;
+        f32_bytes.extend_from_slice(&f32_sample.to_le_bytes());
+    }
+    f32_bytes
+}
+
+async fn connect_openai(call: Arc<Mutex<Call>>) -> Result<mpsc::Sender<Vec<i16>>, Error> {
     let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
 
     let request = tungstenite::http::Request::builder()
@@ -67,13 +86,14 @@ async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+        .header(
+            "Sec-WebSocket-Key",
+            tungstenite::handshake::client::generate_key(),
+        )
         .body(())?;
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-        request, None, false, None,
-    )
-    .await?;
+    let (ws_stream, _) =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, None).await?;
 
     tracing::info!("Connected to OpenAI Realtime API");
 
@@ -89,7 +109,8 @@ async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
                         "type": "server_vad",
                         "threshold": 0.5,
                         "silence_duration_ms": 500,
-                        "prefix_padding_ms": 300
+                        "prefix_padding_ms": 300,
+                        "interrupt_response": false
                     }
                 }
             }
@@ -98,7 +119,9 @@ async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
 
     use futures::SinkExt;
     write
-        .send(tungstenite::Message::Text(session_update.to_string().into()))
+        .send(tungstenite::Message::Text(
+            session_update.to_string().into(),
+        ))
         .await?;
 
     tracing::info!("Sent session.update to OpenAI");
@@ -108,10 +131,7 @@ async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
     // Task: forward audio frames to OpenAI.
     tokio::spawn(async move {
         while let Some(samples) = audio_rx.recv().await {
-            let bytes: Vec<u8> = samples
-                .iter()
-                .flat_map(|s| s.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
             let event = serde_json::json!({
@@ -130,8 +150,10 @@ async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
         tracing::warn!("Audio send task ended");
     });
 
-    // Task: receive and log events from OpenAI.
+    // Task: receive events from OpenAI, buffer response audio, play it back.
     tokio::spawn(async move {
+        let mut audio_buffer: Vec<u8> = Vec::new();
+
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
@@ -152,13 +174,33 @@ async fn connect_openai() -> Result<mpsc::Sender<Vec<i16>>, Error> {
                                 tracing::info!("Speech ended");
                             }
                             "response.created" => {
+                                audio_buffer.clear();
                                 tracing::info!("OpenAI generating response...");
                             }
-                            "response.audio.delta" => {
-                                tracing::debug!("OpenAI audio delta received");
+                            "response.output_audio.delta" => {
+                                if let Some(delta) = event["delta"].as_str() {
+                                    if let Ok(pcm) =
+                                        base64::engine::general_purpose::STANDARD.decode(delta)
+                                    {
+                                        audio_buffer.extend_from_slice(&pcm);
+                                    }
+                                }
                             }
-                            "response.audio.done" => {
-                                tracing::info!("OpenAI response audio complete");
+                            "response.output_audio.done" => {
+                                if !audio_buffer.is_empty() {
+                                    tracing::info!(
+                                        "Playing response audio ({} bytes PCM16)",
+                                        audio_buffer.len()
+                                    );
+                                    // Convert PCM16 to f32, wrap in RawAdapter for songbird.
+                                    let f32_data = pcm16_to_f32_bytes(&audio_buffer);
+                                    let cursor = std::io::Cursor::new(f32_data);
+                                    let raw = RawAdapter::new(cursor, 24000, 1);
+                                    let input = Input::from(raw);
+                                    let mut handler = call.lock().await;
+                                    handler.play_input(input);
+                                    audio_buffer.clear();
+                                }
                             }
                             "response.done" => {
                                 tracing::info!("OpenAI response complete");
@@ -219,17 +261,27 @@ async fn join(ctx: Context<'_>) -> Result<(), Error> {
 
     let call = manager.join(guild_id, channel_id).await?;
 
-    let audio_tx = connect_openai().await?;
+    let audio_tx = connect_openai(call.clone()).await?;
     let audio_tx = Arc::new(audio_tx);
 
     {
-        let mut call = call.lock().await;
-        let receiver = VoiceReceiver { audio_tx: audio_tx.clone() };
-        call.add_global_event(Event::Core(songbird::CoreEvent::SpeakingStateUpdate), receiver);
-        let receiver = VoiceReceiver { audio_tx: audio_tx.clone() };
-        call.add_global_event(Event::Core(songbird::CoreEvent::VoiceTick), receiver);
+        let mut handler = call.lock().await;
+        let receiver = VoiceReceiver {
+            audio_tx: audio_tx.clone(),
+        };
+        handler.add_global_event(
+            Event::Core(songbird::CoreEvent::SpeakingStateUpdate),
+            receiver,
+        );
+        let receiver = VoiceReceiver {
+            audio_tx: audio_tx.clone(),
+        };
+        handler.add_global_event(Event::Core(songbird::CoreEvent::VoiceTick), receiver);
         let receiver = VoiceReceiver { audio_tx };
-        call.add_global_event(Event::Core(songbird::CoreEvent::ClientDisconnect), receiver);
+        handler.add_global_event(
+            Event::Core(songbird::CoreEvent::ClientDisconnect),
+            receiver,
+        );
     }
 
     ctx.say(format!("Joined <#{channel_id}>. Use `/leave` when done."))
