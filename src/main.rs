@@ -1,7 +1,11 @@
+use std::collections::VecDeque;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use base64::Engine;
 use futures::StreamExt;
+use parking_lot::Mutex as SyncMutex;
 use poise::serenity_prelude as serenity;
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use songbird::input::{Input, RawAdapter};
@@ -17,8 +21,50 @@ struct Data {}
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
+/// A ring buffer audio source that never blocks.
+/// Returns audio data when available, silence when empty.
+struct StreamingAudioSource {
+    buffer: Arc<SyncMutex<VecDeque<u8>>>,
+}
+
+impl Read for StreamingAudioSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut ring = self.buffer.lock();
+        if ring.is_empty() {
+            // Return silence instead of blocking — keeps songbird's mixer alive.
+            buf.iter_mut().for_each(|b| *b = 0);
+            Ok(buf.len())
+        } else {
+            let to_read = buf.len().min(ring.len());
+            for byte in buf[..to_read].iter_mut() {
+                *byte = ring.pop_front().unwrap();
+            }
+            Ok(to_read)
+        }
+    }
+}
+
+impl Seek for StreamingAudioSource {
+    fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "not seekable",
+        ))
+    }
+}
+
+impl symphonia::core::io::MediaSource for StreamingAudioSource {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
 struct VoiceReceiver {
     audio_tx: Arc<mpsc::Sender<Vec<i16>>>,
+    ai_speaking: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -33,26 +79,25 @@ impl VoiceEventHandler for VoiceReceiver {
                 );
             }
             EventContext::VoiceTick(tick) => {
+                let ai_speaking = self.ai_speaking.load(Ordering::Relaxed);
                 let mut sent = false;
+
                 for (_ssrc, data) in &tick.speaking {
                     if let Some(decoded) = &data.decoded_voice {
-                        let sum_sq: f64 = decoded
-                            .iter()
-                            .map(|&s| (s as f64) * (s as f64))
-                            .sum();
+                        let sum_sq: f64 =
+                            decoded.iter().map(|&s| (s as f64) * (s as f64)).sum();
                         let rms = (sum_sq / decoded.len() as f64).sqrt();
 
                         if rms > 300.0 {
                             let _ = self.audio_tx.try_send(decoded.clone());
-                        } else {
+                        } else if !ai_speaking {
                             let _ = self.audio_tx.try_send(vec![0i16; 480]);
                         }
                         sent = true;
                     }
                 }
-                // When nobody is speaking, still send silence so OpenAI's
-                // VAD can detect that speech has ended.
-                if !sent {
+
+                if !sent && !ai_speaking {
                     let _ = self.audio_tx.try_send(vec![0i16; 480]);
                 }
             }
@@ -65,9 +110,8 @@ impl VoiceEventHandler for VoiceReceiver {
     }
 }
 
-/// Convert PCM16 LE bytes to f32 bytes (what songbird's RawAdapter expects).
 fn pcm16_to_f32_bytes(pcm16: &[u8]) -> Vec<u8> {
-    let mut f32_bytes = Vec::with_capacity(pcm16.len() * 2); // i16 = 2 bytes, f32 = 4 bytes
+    let mut f32_bytes = Vec::with_capacity(pcm16.len() * 2);
     for chunk in pcm16.chunks_exact(2) {
         let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
         let f32_sample = sample as f32 / 32768.0;
@@ -76,7 +120,10 @@ fn pcm16_to_f32_bytes(pcm16: &[u8]) -> Vec<u8> {
     f32_bytes
 }
 
-async fn connect_openai(call: Arc<Mutex<Call>>) -> Result<mpsc::Sender<Vec<i16>>, Error> {
+async fn connect_openai(
+    call: Arc<Mutex<Call>>,
+    ai_speaking: Arc<AtomicBool>,
+) -> Result<mpsc::Sender<Vec<i16>>, Error> {
     let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
 
     let request = tungstenite::http::Request::builder()
@@ -103,15 +150,19 @@ async fn connect_openai(call: Arc<Mutex<Call>>) -> Result<mpsc::Sender<Vec<i16>>
         "type": "session.update",
         "session": {
             "type": "realtime",
+            "output_modalities": ["audio"],
             "audio": {
                 "input": {
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.5,
                         "silence_duration_ms": 500,
-                        "prefix_padding_ms": 300,
-                        "interrupt_response": false
+                        "prefix_padding_ms": 300
                     }
+                },
+                "output": {
+                    "format": { "type": "audio/pcm", "rate": 24000 },
+                    "voice": "coral"
                 }
             }
         }
@@ -127,6 +178,23 @@ async fn connect_openai(call: Arc<Mutex<Call>>) -> Result<mpsc::Sender<Vec<i16>>
     tracing::info!("Sent session.update to OpenAI");
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(50);
+
+    // Shared ring buffer between OpenAI receive task and songbird's mixer.
+    let playback_buffer: Arc<SyncMutex<VecDeque<u8>>> =
+        Arc::new(SyncMutex::new(VecDeque::with_capacity(96000)));
+
+    // Create a single long-lived streaming source and start playing immediately.
+    // It returns silence when empty, audio when data arrives.
+    {
+        let source = StreamingAudioSource {
+            buffer: playback_buffer.clone(),
+        };
+        let raw = RawAdapter::new(source, 24000, 1);
+        let input = Input::from(raw);
+        let mut handler = call.lock().await;
+        handler.play_input(input);
+        tracing::info!("Streaming playback track started");
+    }
 
     // Task: forward audio frames to OpenAI.
     tokio::spawn(async move {
@@ -150,10 +218,10 @@ async fn connect_openai(call: Arc<Mutex<Call>>) -> Result<mpsc::Sender<Vec<i16>>
         tracing::warn!("Audio send task ended");
     });
 
-    // Task: receive events from OpenAI, buffer response audio, play it back.
-    tokio::spawn(async move {
-        let mut audio_buffer: Vec<u8> = Vec::new();
+    let playback_buf = playback_buffer.clone();
 
+    // Task: receive events from OpenAI, push audio into the ring buffer.
+    tokio::spawn(async move {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
@@ -169,40 +237,32 @@ async fn connect_openai(call: Arc<Mutex<Call>>) -> Result<mpsc::Sender<Vec<i16>>
                             }
                             "input_audio_buffer.speech_started" => {
                                 tracing::info!("Speech detected");
+                                // Clear any remaining AI audio for barge-in.
+                                playback_buf.lock().clear();
+                                ai_speaking.store(false, Ordering::Relaxed);
                             }
                             "input_audio_buffer.speech_stopped" => {
                                 tracing::info!("Speech ended");
                             }
                             "response.created" => {
-                                audio_buffer.clear();
-                                tracing::info!("OpenAI generating response...");
+                                ai_speaking.store(true, Ordering::Relaxed);
+                                tracing::info!("Streaming AI response...");
                             }
                             "response.output_audio.delta" => {
                                 if let Some(delta) = event["delta"].as_str() {
-                                    if let Ok(pcm) =
+                                    if let Ok(pcm16) =
                                         base64::engine::general_purpose::STANDARD.decode(delta)
                                     {
-                                        audio_buffer.extend_from_slice(&pcm);
+                                        let f32_data = pcm16_to_f32_bytes(&pcm16);
+                                        playback_buf.lock().extend(f32_data.iter());
                                     }
                                 }
                             }
                             "response.output_audio.done" => {
-                                if !audio_buffer.is_empty() {
-                                    tracing::info!(
-                                        "Playing response audio ({} bytes PCM16)",
-                                        audio_buffer.len()
-                                    );
-                                    // Convert PCM16 to f32, wrap in RawAdapter for songbird.
-                                    let f32_data = pcm16_to_f32_bytes(&audio_buffer);
-                                    let cursor = std::io::Cursor::new(f32_data);
-                                    let raw = RawAdapter::new(cursor, 24000, 1);
-                                    let input = Input::from(raw);
-                                    let mut handler = call.lock().await;
-                                    handler.play_input(input);
-                                    audio_buffer.clear();
-                                }
+                                tracing::info!("Response audio stream complete");
                             }
                             "response.done" => {
+                                ai_speaking.store(false, Ordering::Relaxed);
                                 tracing::info!("OpenAI response complete");
                             }
                             "error" => {
@@ -260,14 +320,16 @@ async fn join(ctx: Context<'_>) -> Result<(), Error> {
     ));
 
     let call = manager.join(guild_id, channel_id).await?;
+    let ai_speaking = Arc::new(AtomicBool::new(false));
 
-    let audio_tx = connect_openai(call.clone()).await?;
+    let audio_tx = connect_openai(call.clone(), ai_speaking.clone()).await?;
     let audio_tx = Arc::new(audio_tx);
 
     {
         let mut handler = call.lock().await;
         let receiver = VoiceReceiver {
             audio_tx: audio_tx.clone(),
+            ai_speaking: ai_speaking.clone(),
         };
         handler.add_global_event(
             Event::Core(songbird::CoreEvent::SpeakingStateUpdate),
@@ -275,9 +337,13 @@ async fn join(ctx: Context<'_>) -> Result<(), Error> {
         );
         let receiver = VoiceReceiver {
             audio_tx: audio_tx.clone(),
+            ai_speaking: ai_speaking.clone(),
         };
         handler.add_global_event(Event::Core(songbird::CoreEvent::VoiceTick), receiver);
-        let receiver = VoiceReceiver { audio_tx };
+        let receiver = VoiceReceiver {
+            audio_tx,
+            ai_speaking,
+        };
         handler.add_global_event(
             Event::Core(songbird::CoreEvent::ClientDisconnect),
             receiver,

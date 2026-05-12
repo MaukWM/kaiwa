@@ -1578,6 +1578,7 @@ dependencies = [
  "base64",
  "dotenvy",
  "futures",
+ "parking_lot 0.12.5",
  "poise",
  "serde",
  "serde_json",
