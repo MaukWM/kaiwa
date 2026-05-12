@@ -404,7 +404,9 @@ async fn main() {
         .await
         .expect("Failed to create client");
 
-    if let Err(e) = client.start().await {
-        tracing::error!("Client error: {}", e);
+    eprintln!("Starting client...");
+    match client.start().await {
+        Ok(()) => eprintln!("Client returned Ok"),
+        Err(e) => eprintln!("Client error: {}", e),
     }
 }
