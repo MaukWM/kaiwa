@@ -1575,10 +1575,15 @@ name = "kaiwa"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "dotenvy",
+ "futures",
  "poise",
+ "serde",
+ "serde_json",
  "songbird",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
 ]
