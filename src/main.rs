@@ -14,7 +14,7 @@ use songbird::SerenityInit;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite;
 
-const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";
+const DEFAULT_MODEL: &str = "gpt-realtime-mini";
 
 struct Data {}
 
@@ -122,9 +122,11 @@ async fn connect_openai(
     ai_speaking: Arc<AtomicBool>,
 ) -> Result<mpsc::Sender<Vec<i16>>, Error> {
     let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let url = format!("wss://api.openai.com/v1/realtime?model={model}");
 
     let request = tungstenite::http::Request::builder()
-        .uri(OPENAI_REALTIME_URL)
+        .uri(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Host", "api.openai.com")
         .header("Connection", "Upgrade")

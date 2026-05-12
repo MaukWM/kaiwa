@@ -1,0 +1,10 @@
+services:
+  kaiwa:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '2.0'
