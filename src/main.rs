@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use base64::Engine;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex as SyncMutex;
 use poise::serenity_prelude as serenity;
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
@@ -21,8 +21,6 @@ struct Data {}
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
-/// A ring buffer audio source that never blocks.
-/// Returns audio data when available, silence when empty.
 struct StreamingAudioSource {
     buffer: Arc<SyncMutex<VecDeque<u8>>>,
 }
@@ -31,7 +29,6 @@ impl Read for StreamingAudioSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut ring = self.buffer.lock();
         if ring.is_empty() {
-            // Return silence instead of blocking — keeps songbird's mixer alive.
             buf.iter_mut().for_each(|b| *b = 0);
             Ok(buf.len())
         } else {
@@ -162,13 +159,12 @@ async fn connect_openai(
                 },
                 "output": {
                     "format": { "type": "audio/pcm", "rate": 24000 },
-                    "voice": "coral"
+                    "voice": "ash"
                 }
             }
         }
     });
 
-    use futures::SinkExt;
     write
         .send(tungstenite::Message::Text(
             session_update.to_string().into(),
@@ -179,12 +175,9 @@ async fn connect_openai(
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(50);
 
-    // Shared ring buffer between OpenAI receive task and songbird's mixer.
     let playback_buffer: Arc<SyncMutex<VecDeque<u8>>> =
         Arc::new(SyncMutex::new(VecDeque::with_capacity(96000)));
 
-    // Create a single long-lived streaming source and start playing immediately.
-    // It returns silence when empty, audio when data arrives.
     {
         let source = StreamingAudioSource {
             buffer: playback_buffer.clone(),
@@ -237,7 +230,6 @@ async fn connect_openai(
                             }
                             "input_audio_buffer.speech_started" => {
                                 tracing::info!("Speech detected");
-                                // Clear any remaining AI audio for barge-in.
                                 playback_buf.lock().clear();
                                 ai_speaking.store(false, Ordering::Relaxed);
                             }
