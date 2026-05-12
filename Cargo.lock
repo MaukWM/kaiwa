@@ -1574,6 +1574,7 @@ dependencies = [
 name = "kaiwa"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dotenvy",
  "poise",
  "songbird",
